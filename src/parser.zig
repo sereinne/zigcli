@@ -1,9 +1,9 @@
+// module import
 const std = @import("std");
 // function imports
 const parseInt = std.fmt.parseInt;
 const parseFloat = std.fmt.parseFloat;
 const eql = std.mem.eql;
-
 pub fn Parser(comptime T: type) type {
     return *const fn ([]const u8) anyerror!T;
 }
@@ -42,5 +42,5 @@ fn parseToBool(item: []const u8) !bool {
     } else if (eql(u8, item, "false")) {
         return false;
     }
-    return error.invalidBoolStr;
+    return error.parseBooleanError;
 }
