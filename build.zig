@@ -16,4 +16,27 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(root_lib);
+
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    exe_mod.addImport("zigcli", root_module);
+
+    const exe = b.addExecutable(.{
+        .name = "demo",
+        .root_module = exe_mod,
+    });
+
+    const exe_run = b.addRunArtifact(exe);
+
+    if (b.args) |args| {
+        exe_run.addArgs(args);
+    }
+
+    const run = b.step("r", "run exe");
+
+    run.dependOn(&exe_run.step);
 }
