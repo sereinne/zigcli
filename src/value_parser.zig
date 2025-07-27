@@ -36,6 +36,22 @@ pub fn parseWithFallback(comptime Priority: type, comptime Fallback: type, item:
     };
 }
 
+pub fn parseDefault(comptime Priority: type, to_parse: []const u8) !Priority {
+    const info = @typeInfo(Priority);
+    return switch (info) {
+        .bool => try parseToBool(to_parse),
+        .int => try parseInt(Priority, to_parse, 10),
+        .float => try parseFloat(Priority, to_parse),
+        .pointer => |pinfo| {
+            if (pinfo.child == u8 and pinfo.is_const and pinfo.alignment == 1 and pinfo.size == .slice) {
+                return to_parse;
+            }
+            @compileError("ERROR: unsupported pointer type, only supports strings which is `[]const u8`");
+        },
+        else => unreachable,
+    };
+}
+
 fn parseToBool(item: []const u8) !bool {
     if (eql(u8, item, "true")) {
         return true;

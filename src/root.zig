@@ -9,6 +9,8 @@ const Allocator = std.mem.Allocator;
 const ArgIterator = std.process.ArgIterator;
 const Parser = parser.Parser;
 const Pair = argparser.Pair;
+pub const parseWithFallback = parser.parseWithFallback;
+pub const parseDefault = parser.parseDefault;
 // function aliases
 const print = std.debug.print;
 const eql = std.mem.eql;
@@ -50,12 +52,15 @@ pub fn getSubcommands(comptime T: type) []const []const u8 {
 }
 
 pub fn CLIApp(comptime T: type) type {
-    const info = @typeInfo(T);
+    const inner_info = @typeInfo(T);
 
-    if (info != .@"struct") {
+    if (inner_info != .@"struct") {
         const tname = @typeName(T);
         @compileError("ERROR: " ++ tname ++ " must be a struct!");
     }
+
+    const struct_info = inner_info.@"struct";
+    _ = struct_info; // autofix
 
     const subcommands = getSubcommands(T);
 
@@ -63,88 +68,59 @@ pub fn CLIApp(comptime T: type) type {
         const Self = @This();
 
         inner: T,
-        iter: ArgIterator,
-        prev: ?[]const u8 = null,
+        args: ArgIterator,
 
         pub fn init(allocator: Allocator) Self {
             const iter = std.process.argsWithAllocator(allocator) catch unreachable;
             // const inner: T = if (hasDefaultValues(T)) T{} else undefined;
             return Self{
                 .inner = undefined,
-                .iter = iter,
+                .args = iter,
             };
         }
         pub fn deinit(self: *Self) void {
-            self.iter.deinit();
+            self.args.deinit();
+        }
+
+        fn modifyFieldRec(s: anytype, scope: []const u8, key: []const u8, value: []const u8) !void {
+            if (!isPointerToStruct(@TypeOf(s))) {
+                return error.NotAPtrToAStruct;
+            }
+
+            const info = @typeInfo(@TypeOf(s.*));
+            const fields = info.@"struct".fields;
+
+            inline for (fields) |field| {
+                const inner = @typeInfo(field.type);
+                if (isSubcommand(scope) and inner == .@"struct") {
+                    try modifyFieldRec(&@field(s, field.name), scope, key, value);
+                } else if (eql(u8, field.name, key)) {
+                    // @field(s, field.name) = try parseWithFallback(field.type, void, value, null);
+                    @field(s, field.name) = try parseDefault(field.type, value);
+                }
+            }
         }
 
         pub fn parse(self: *Self) !void {
-            // `git --no-pager diff --staged src/main.zig`
-            // `<main-command> <flags...> <args...> <sub-command> <flags...> <args...>`
-            const main_command = self.iter.next().?;
-            const bin_path = getSuffix(main_command);
-            print("hey found main command {s}\n", .{bin_path});
-
-            while (self.iter.next()) |arg| {
-                if (self.prev) |prev| {
-                    if (isOption(arg)) {
-                        const tmp = prev;
-                        self.prev = arg;
-                        const pair = Pair{ .name = tmp, .value = null };
-                        print("hey found flag {s}->{any}\n", .{ pair.name, pair.value });
-                        continue;
-                    } else {
-                        const tmp = prev;
-                        self.prev = null;
-                        const pair = Pair{ .name = tmp, .value = arg };
-                        print("hey found flag {s}->{s}\n", .{ pair.name, pair.value.? });
-                        continue;
-                    }
-                }
-                var curr_cmd = main_command;
-                if (isOption(arg)) {
-                    print("hey is option! {s}\n", .{arg});
-                    const pair = self.getOptionValue(arg);
-                    if (pair.value) |value| {
-                        print("hey found flag {s}->{s}\n", .{ pair.name, value });
-                    } else {
-                        print("hey found flag {s}->{any}\n", .{ pair.name, pair.value });
-                    }
+            const exe_path = self.args.next().?;
+            const main_scope = getSuffix(exe_path);
+            var curr_scope = main_scope;
+            while (self.args.next()) |arg| {
+                if (isAssignmentOption(arg)) {
+                    const pair = extractAssignmentOption(arg);
+                    const stripped = pair.name[2..];
+                    try modifyFieldRec(&self.inner, curr_scope, stripped, pair.value.?);
                 } else if (isSubcommand(arg)) {
-                    curr_cmd = arg;
-                    print("hey found subcommand {s}\n", .{curr_cmd});
-                } else {
-                    print("hey found arguments {s}\n", .{arg});
+                    curr_scope = arg;
                 }
             }
         }
 
-        fn getOptionValue(self: *Self, flag: []const u8) Pair {
-            if (isAssignmentOption(flag)) {
-                return extractAssignmentOption(flag);
-            }
-
-            const possibleValue = self.iter.next() orelse return Pair{ .name = flag, .value = null };
-            if (isOption(possibleValue)) {
-                self.prev = possibleValue;
-                return Pair{ .name = flag, .value = null };
-            }
-
-            if (isSubcommand(possibleValue)) {
-                print("hey found subcommand {s}\n", .{possibleValue});
-                return Pair{ .name = flag, .value = null };
-            }
-
-            const stripped = flag[2..];
-            inline for (info.@"struct".fields) |field| {
-                if (eql(u8, field.name, stripped)) {
-                    if (field.type == bool) {
-                        return Pair{ .name = flag, .value = null };
-                    }
-                }
-            }
-
-            return Pair{ .name = flag, .value = possibleValue };
+        fn extractAssignmentOption(opt: []const u8) Pair {
+            const eq_sign_idx = std.mem.indexOf(u8, opt, "=").?;
+            const name = opt[0..eq_sign_idx];
+            const value = opt[(eq_sign_idx + 1)..];
+            return Pair{ .name = name, .value = value };
         }
 
         fn getSuffix(path: []const u8) []const u8 {
@@ -159,17 +135,6 @@ pub fn CLIApp(comptime T: type) type {
             return "";
         }
 
-        fn extractAssignmentOption(flag: []const u8) Pair {
-            const index = std.mem.indexOf(u8, flag, "=").?;
-            const name = flag[0..index];
-            const value = flag[(index + 1)..];
-            return Pair{ .name = name, .value = value };
-        }
-
-        fn isOption(arg: []const u8) bool {
-            return std.mem.startsWith(u8, arg, "--");
-        }
-
         fn isAssignmentOption(arg: []const u8) bool {
             return std.mem.containsAtLeast(u8, arg, 1, "=");
         }
@@ -181,6 +146,20 @@ pub fn CLIApp(comptime T: type) type {
                 }
             }
             return false;
+        }
+
+        fn isPointerToStruct(comptime V: type) bool {
+            const info = @typeInfo(V);
+            return switch (info) {
+                .pointer => |ptr| {
+                    const child_info = @typeInfo(ptr.child);
+                    if (child_info != .@"struct") {
+                        return false;
+                    }
+                    return true;
+                },
+                else => return false,
+            };
         }
     };
 }
