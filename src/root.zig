@@ -59,9 +59,6 @@ pub fn CLIApp(comptime T: type) type {
         @compileError("ERROR: " ++ tname ++ " must be a struct!");
     }
 
-    const struct_info = inner_info.@"struct";
-    _ = struct_info; // autofix
-
     const subcommands = getSubcommands(T);
 
     return struct {
@@ -82,7 +79,7 @@ pub fn CLIApp(comptime T: type) type {
             self.args.deinit();
         }
 
-        fn modifyFieldRec(s: anytype, scope: []const u8, key: []const u8, value: []const u8) !void {
+        fn modifyFieldRecursive(s: anytype, scope: []const u8, key: []const u8, value: []const u8) !void {
             if (!isPointerToStruct(@TypeOf(s))) {
                 return error.NotAPtrToAStruct;
             }
@@ -91,12 +88,68 @@ pub fn CLIApp(comptime T: type) type {
             const fields = info.@"struct".fields;
 
             inline for (fields) |field| {
-                const inner = @typeInfo(field.type);
-                if (isSubcommand(scope) and inner == .@"struct") {
-                    try modifyFieldRec(&@field(s, field.name), scope, key, value);
-                } else if (eql(u8, field.name, key)) {
-                    // @field(s, field.name) = try parseWithFallback(field.type, void, value, null);
+                const child_info = @typeInfo(field.type);
+                if (isSubcommand(scope) and child_info == .@"struct") {
+                    try modifyFieldRecursive(&@field(s, field.name), scope, key, value);
+                    return;
+                }
+            }
+
+            inline for (fields) |field| {
+                if (eql(u8, field.name, key)) {
                     @field(s, field.name) = try parseDefault(field.type, value);
+                    return;
+                }
+            }
+
+            return error.UnknownFlag;
+        }
+
+        fn invertFieldRecursive(s: anytype, scope: []const u8, key: []const u8) !void {
+            if (!isPointerToStruct(@TypeOf(s))) {
+                return error.NotAPtrToAStruct;
+            }
+
+            const info = @typeInfo(@TypeOf(s.*));
+            const fields = info.@"struct".fields;
+
+            inline for (fields) |field| {
+                const child_info = @typeInfo(field.type);
+                if (isSubcommand(scope) and child_info == .@"struct") {
+                    try invertFieldRecursive(&@field(s, field.name), scope, key);
+                    return;
+                }
+            }
+
+            inline for (fields) |field| {
+                if (eql(u8, field.name, key) and field.type == bool) {
+                    @field(s, field.name) = !@field(s, field.name);
+                    return;
+                }
+            }
+
+            return error.UnknownFlag;
+        }
+
+        fn addArgRecursive(s: anytype, scope: []const u8, cmd_arg: []const u8) !void {
+            if (!isPointerToStruct(@TypeOf(s))) {
+                return error.NotAPtrToAStruct;
+            }
+
+            const info = @typeInfo(@TypeOf(s.*));
+            const fields = info.@"struct".fields;
+
+            inline for (fields) |field| {
+                const child_info = @typeInfo(field.type);
+                if (isSubcommand(scope) and child_info == .@"struct") {
+                    try addArgRecursive(&@field(s, field.name), scope, cmd_arg);
+                    return;
+                }
+            }
+
+            inline for (fields) |field| {
+                if (eql(u8, field.name, "arg") and field.type == []const u8) {
+                    @field(s, field.name) = cmd_arg;
                 }
             }
         }
@@ -109,9 +162,14 @@ pub fn CLIApp(comptime T: type) type {
                 if (isAssignmentOption(arg)) {
                     const pair = extractAssignmentOption(arg);
                     const stripped = pair.name[2..];
-                    try modifyFieldRec(&self.inner, curr_scope, stripped, pair.value.?);
+                    try modifyFieldRecursive(&self.inner, curr_scope, stripped, pair.value.?);
+                } else if (isTrailingOption(arg)) {
+                    const stripped = arg[2..];
+                    try invertFieldRecursive(&self.inner, curr_scope, stripped);
                 } else if (isSubcommand(arg)) {
                     curr_scope = arg;
+                } else {
+                    try addArgRecursive(&self.inner, curr_scope, arg);
                 }
             }
         }
@@ -139,6 +197,10 @@ pub fn CLIApp(comptime T: type) type {
             return std.mem.containsAtLeast(u8, arg, 1, "=");
         }
 
+        fn isTrailingOption(arg: []const u8) bool {
+            return std.mem.startsWith(u8, arg, "--");
+        }
+
         fn isSubcommand(arg: []const u8) bool {
             for (subcommands) |subcommand| {
                 if (eql(u8, arg, subcommand)) {
@@ -146,6 +208,15 @@ pub fn CLIApp(comptime T: type) type {
                 }
             }
             return false;
+        }
+
+        fn findSubcommand(arg: []const u8) ?[]const u8 {
+            for (subcommands) |subcommand| {
+                if (eql(u8, arg, subcommand)) {
+                    return subcommand;
+                }
+            }
+            return null;
         }
 
         fn isPointerToStruct(comptime V: type) bool {
