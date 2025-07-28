@@ -7,6 +7,7 @@ const parser = @import("value_parser.zig");
 // const ArgumentParserIterator = argparser.ArgumentParserIterator;
 const Allocator = std.mem.Allocator;
 const ArgIterator = std.process.ArgIterator;
+const ArrayListAligned = std.ArrayListAligned;
 const Parser = parser.Parser;
 const Pair = argparser.Pair;
 pub const parseWithFallback = parser.parseWithFallback;
@@ -66,6 +67,7 @@ pub fn CLIApp(comptime T: type) type {
 
         inner: T,
         args: ArgIterator,
+        prev: ?[]const u8 = null,
 
         pub fn init(allocator: Allocator) Self {
             const iter = std.process.argsWithAllocator(allocator) catch unreachable;
@@ -125,6 +127,8 @@ pub fn CLIApp(comptime T: type) type {
                 if (eql(u8, field.name, key) and field.type == bool) {
                     @field(s, field.name) = !@field(s, field.name);
                     return;
+                } else if (eql(u8, field.name, key) and field.type != bool) {
+                    return error.MismatchedTypes;
                 }
             }
 
@@ -148,7 +152,7 @@ pub fn CLIApp(comptime T: type) type {
             }
 
             inline for (fields) |field| {
-                if (eql(u8, field.name, "arg") and field.type == []const u8) {
+                if (eql(u8, field.name, "args") and field.type == []const u8) {
                     @field(s, field.name) = cmd_arg;
                 }
             }
@@ -163,13 +167,79 @@ pub fn CLIApp(comptime T: type) type {
                     const pair = extractAssignmentOption(arg);
                     const stripped = pair.name[2..];
                     try modifyFieldRecursive(&self.inner, curr_scope, stripped, pair.value.?);
-                } else if (isTrailingOption(arg)) {
+                } else if (isOption(arg)) {
+                    const possibleValue = self.args.next();
                     const stripped = arg[2..];
-                    try invertFieldRecursive(&self.inner, curr_scope, stripped);
+                    if (possibleValue) |pv| {
+                        if (isAssignmentOption(pv)) {
+                            try invertFieldRecursive(&self.inner, curr_scope, stripped);
+                            const pair = extractAssignmentOption(pv);
+                            const key = pair.name[2..];
+                            try modifyFieldRecursive(&self.inner, curr_scope, key, pair.value.?);
+                        } else if (isOption(pv)) {
+                            self.prev = pv;
+                            try invertFieldRecursive(&self.inner, curr_scope, stripped);
+                        } else if (isSubcommand(pv)) {
+                            // this executes when the arguments look like `demo --pager diff` with the assumption that `pager` is a boolean
+                            try invertFieldRecursive(&self.inner, curr_scope, stripped);
+                            curr_scope = pv;
+                            self.prev = null;
+                        } else {
+                            try modifyFieldRecursive(&self.inner, curr_scope, stripped, pv);
+                        }
+                    } else {
+                        // this executes when the arguments look like `demo --pager` with the assumption that `pager` is a boolean
+                        try invertFieldRecursive(&self.inner, curr_scope, stripped);
+                    }
                 } else if (isSubcommand(arg)) {
                     curr_scope = arg;
                 } else {
                     try addArgRecursive(&self.inner, curr_scope, arg);
+                }
+
+                if (self.prev) |prev| {
+                    if (isAssignmentOption(prev)) {
+                        const pair = extractAssignmentOption(prev);
+                        const stripped = pair.name[2..];
+                        try modifyFieldRecursive(&self.inner, curr_scope, stripped, pair.value.?);
+                    } else if (isOption(prev)) {
+                        const possibleValue = self.args.next();
+                        if (possibleValue) |pv| {
+                            if (isAssignmentOption(pv)) {
+                                const stripped = prev[2..];
+                                try invertFieldRecursive(&self.inner, curr_scope, stripped);
+                                const pair = extractAssignmentOption(pv);
+                                const key = pair.name[2..];
+                                try modifyFieldRecursive(&self.inner, curr_scope, key, pair.value.?);
+                                self.prev = null;
+                            } else if (isOption(pv)) {
+                                const stripped = prev[2..];
+                                self.prev = pv;
+                                try invertFieldRecursive(&self.inner, curr_scope, stripped);
+                            } else if (isSubcommand(pv)) {
+                                const stripped = prev[2..];
+                                try invertFieldRecursive(&self.inner, curr_scope, stripped);
+                                curr_scope = pv;
+                                self.prev = null;
+                            } else {
+                                const stripped = prev[2..];
+                                self.prev = null;
+                                try modifyFieldRecursive(&self.inner, curr_scope, stripped, pv);
+                            }
+                        } else {
+                            const stripped = prev[2..];
+                            self.prev = null;
+                            try invertFieldRecursive(&self.inner, curr_scope, stripped);
+                        }
+                    }
+                }
+            }
+
+            if (self.prev) |prev| {
+                if (isOption(prev)) {
+                    const stripped = prev[2..];
+                    self.prev = null;
+                    try invertFieldRecursive(&self.inner, curr_scope, stripped);
                 }
             }
         }
@@ -197,7 +267,7 @@ pub fn CLIApp(comptime T: type) type {
             return std.mem.containsAtLeast(u8, arg, 1, "=");
         }
 
-        fn isTrailingOption(arg: []const u8) bool {
+        fn isOption(arg: []const u8) bool {
             return std.mem.startsWith(u8, arg, "--");
         }
 
