@@ -19,7 +19,8 @@ pub fn parseWithFallback(comptime Priority: type, comptime Fallback: type, item:
             if (pinfo.child == u8 and pinfo.is_const and pinfo.alignment == 1 and pinfo.size == .slice) {
                 return item;
             }
-            @compileError("ERROR: unsupported pointer type, only supports strings which is `[]const u8`");
+            //@compileError("ERROR: unsupported pointer type, only supports strings which is `[]const u8`");
+            return error.UnsupportedPointer;
         },
         else => {
             if (Priority == Fallback) {
@@ -46,7 +47,8 @@ pub fn parseDefault(comptime Priority: type, to_parse: []const u8) !Priority {
             if (pinfo.child == u8 and pinfo.is_const and pinfo.alignment == 1 and pinfo.size == .slice) {
                 return to_parse;
             }
-            @compileError("ERROR: unsupported pointer type, only supports strings which is `[]const u8`");
+            // @compileError("ERROR: unsupported pointer type, only supports strings which is `[]const u8`");
+            return error.UnsupportedPointer;
         },
         else => unreachable,
     };

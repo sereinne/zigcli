@@ -37,19 +37,37 @@ fn hasDefaultValues(comptime T: type) bool {
     return true;
 }
 
-pub fn getSubcommands(comptime T: type) []const []const u8 {
+fn getSubcommands(comptime T: type) []const []const u8 {
     comptime var result: []const []const u8 = &.{};
     const info = @typeInfo(T);
     const fields = info.@"struct".fields;
     comptime {
         for (fields) |field| {
             const field_type = @typeInfo(field.type);
-            if (field_type == .@"struct") {
+            if (field_type == .@"struct" and field.type != Allocator and field.type != std.ArrayList([]const u8)) {
                 result = result ++ &[_][]const u8{field.name};
             }
         }
     }
     return result;
+}
+
+fn isValidArgsType(comptime T: type) void {
+    const typeinfo = @typeInfo(T);
+    if (typeinfo != .@"struct") {
+        const type_name = @typeName(T);
+        @compileError("ERROR: type " ++ type_name ++ " must be a struct");
+    }
+
+    const fields = typeinfo.@"struct".fields;
+    inline for (fields) |field| {
+        const field_info = @typeInfo(field.type);
+        if (field_info == .@"struct") {
+            isValidArgsType(field.type);
+        } else if (eql(u8, field.name, "args") and field.type != std.ArrayList([]const u8)) {
+            @compileError("found invalid args");
+        }
+    }
 }
 
 pub fn CLIApp(comptime T: type) type {
@@ -60,6 +78,8 @@ pub fn CLIApp(comptime T: type) type {
         @compileError("ERROR: " ++ tname ++ " must be a struct!");
     }
 
+    isValidArgsType(T);
+
     const subcommands = getSubcommands(T);
 
     return struct {
@@ -67,7 +87,9 @@ pub fn CLIApp(comptime T: type) type {
 
         inner: T,
         args: ArgIterator,
+        allocator: Allocator,
         prev: ?[]const u8 = null,
+        search_scope: []const u8 = "",
 
         pub fn init(allocator: Allocator) Self {
             const iter = std.process.argsWithAllocator(allocator) catch unreachable;
@@ -75,173 +97,214 @@ pub fn CLIApp(comptime T: type) type {
             return Self{
                 .inner = undefined,
                 .args = iter,
+                .allocator = allocator,
             };
         }
         pub fn deinit(self: *Self) void {
             self.args.deinit();
         }
 
-        fn modifyFieldRecursive(s: anytype, scope: []const u8, key: []const u8, value: []const u8) !void {
-            if (!isPointerToStruct(@TypeOf(s))) {
-                return error.NotAPtrToAStruct;
-            }
-
-            const info = @typeInfo(@TypeOf(s.*));
-            const fields = info.@"struct".fields;
-
-            inline for (fields) |field| {
-                const child_info = @typeInfo(field.type);
-                if (isSubcommand(scope) and child_info == .@"struct") {
-                    try modifyFieldRecursive(&@field(s, field.name), scope, key, value);
-                    return;
-                }
-            }
-
-            inline for (fields) |field| {
-                if (eql(u8, field.name, key)) {
-                    @field(s, field.name) = try parseDefault(field.type, value);
-                    return;
-                }
-            }
-
-            return error.UnknownFlag;
-        }
-
-        fn invertFieldRecursive(s: anytype, scope: []const u8, key: []const u8) !void {
-            if (!isPointerToStruct(@TypeOf(s))) {
-                return error.NotAPtrToAStruct;
-            }
-
-            const info = @typeInfo(@TypeOf(s.*));
-            const fields = info.@"struct".fields;
-
-            inline for (fields) |field| {
-                const child_info = @typeInfo(field.type);
-                if (isSubcommand(scope) and child_info == .@"struct") {
-                    try invertFieldRecursive(&@field(s, field.name), scope, key);
-                    return;
-                }
-            }
-
-            inline for (fields) |field| {
-                if (eql(u8, field.name, key) and field.type == bool) {
-                    @field(s, field.name) = !@field(s, field.name);
-                    return;
-                } else if (eql(u8, field.name, key) and field.type != bool) {
-                    return error.MismatchedTypes;
-                }
-            }
-
-            return error.UnknownFlag;
-        }
-
-        fn addArgRecursive(s: anytype, scope: []const u8, cmd_arg: []const u8) !void {
-            if (!isPointerToStruct(@TypeOf(s))) {
-                return error.NotAPtrToAStruct;
-            }
-
-            const info = @typeInfo(@TypeOf(s.*));
-            const fields = info.@"struct".fields;
-
-            inline for (fields) |field| {
-                const child_info = @typeInfo(field.type);
-                if (isSubcommand(scope) and child_info == .@"struct") {
-                    try addArgRecursive(&@field(s, field.name), scope, cmd_arg);
-                    return;
-                }
-            }
-
-            inline for (fields) |field| {
-                if (eql(u8, field.name, "args") and field.type == []const u8) {
-                    @field(s, field.name) = cmd_arg;
-                }
-            }
-        }
-
         pub fn parse(self: *Self) !void {
-            const exe_path = self.args.next().?;
-            const main_scope = getSuffix(exe_path);
-            var curr_scope = main_scope;
+            const main_cmd = self.args.next().?;
+            self.search_scope = getSuffix(main_cmd);
+            self.initializeCmdArgs(&self.inner);
             while (self.args.next()) |arg| {
-                if (isAssignmentOption(arg)) {
-                    const pair = extractAssignmentOption(arg);
-                    const stripped = pair.name[2..];
-                    try modifyFieldRecursive(&self.inner, curr_scope, stripped, pair.value.?);
-                } else if (isOption(arg)) {
-                    const possibleValue = self.args.next();
-                    const stripped = arg[2..];
-                    if (possibleValue) |pv| {
-                        if (isAssignmentOption(pv)) {
-                            try invertFieldRecursive(&self.inner, curr_scope, stripped);
-                            const pair = extractAssignmentOption(pv);
-                            const key = pair.name[2..];
-                            try modifyFieldRecursive(&self.inner, curr_scope, key, pair.value.?);
-                        } else if (isOption(pv)) {
-                            self.prev = pv;
-                            try invertFieldRecursive(&self.inner, curr_scope, stripped);
-                        } else if (isSubcommand(pv)) {
-                            // this executes when the arguments look like `demo --pager diff` with the assumption that `pager` is a boolean
-                            try invertFieldRecursive(&self.inner, curr_scope, stripped);
-                            curr_scope = pv;
-                            self.prev = null;
-                        } else {
-                            try modifyFieldRecursive(&self.inner, curr_scope, stripped, pv);
-                        }
-                    } else {
-                        // this executes when the arguments look like `demo --pager` with the assumption that `pager` is a boolean
-                        try invertFieldRecursive(&self.inner, curr_scope, stripped);
-                    }
-                } else if (isSubcommand(arg)) {
-                    curr_scope = arg;
-                } else {
-                    try addArgRecursive(&self.inner, curr_scope, arg);
-                }
-
                 if (self.prev) |prev| {
-                    if (isAssignmentOption(prev)) {
-                        const pair = extractAssignmentOption(prev);
+                    if (isOption(prev)) {
+                        const tmp = prev;
+                        self.prev = null;
+                        const pair = self.handleOption(&self.inner, tmp);
+
+                        print("PAIR in prev block inside while loop: {s}->{s}\n", .{ pair.name, pair.value orelse "null" });
+
                         const stripped = pair.name[2..];
-                        try modifyFieldRecursive(&self.inner, curr_scope, stripped, pair.value.?);
-                    } else if (isOption(prev)) {
-                        const possibleValue = self.args.next();
-                        if (possibleValue) |pv| {
-                            if (isAssignmentOption(pv)) {
-                                const stripped = prev[2..];
-                                try invertFieldRecursive(&self.inner, curr_scope, stripped);
-                                const pair = extractAssignmentOption(pv);
-                                const key = pair.name[2..];
-                                try modifyFieldRecursive(&self.inner, curr_scope, key, pair.value.?);
-                                self.prev = null;
-                            } else if (isOption(pv)) {
-                                const stripped = prev[2..];
-                                self.prev = pv;
-                                try invertFieldRecursive(&self.inner, curr_scope, stripped);
-                            } else if (isSubcommand(pv)) {
-                                const stripped = prev[2..];
-                                try invertFieldRecursive(&self.inner, curr_scope, stripped);
-                                curr_scope = pv;
-                                self.prev = null;
-                            } else {
-                                const stripped = prev[2..];
-                                self.prev = null;
-                                try modifyFieldRecursive(&self.inner, curr_scope, stripped, pv);
-                            }
-                        } else {
-                            const stripped = prev[2..];
-                            self.prev = null;
-                            try invertFieldRecursive(&self.inner, curr_scope, stripped);
-                        }
+                        if (pair.value) |value| try self.modifyInnerField(&self.inner, stripped, value) else try self.invertInnerField(&self.inner, stripped);
+                    } else if (isSubcommand(prev)) {
+                        self.search_scope = prev;
+                        self.prev = null;
+                    } else {
+                        print("add args inside while loop inside self.prev", .{});
+                        try self.addArgsToCmd(&self.inner, prev);
+                        self.prev = null;
                     }
+                }
+                if (isOption(arg)) {
+                    const pair = self.handleOption(&self.inner, arg);
+                    print("PAIR in isoption(arg) block inside while loop: {s}->{s}\n", .{ pair.name, pair.value orelse "null" });
+
+                    const stripped = pair.name[2..];
+                    if (pair.value) |value| try self.modifyInnerField(&self.inner, stripped, value) else try self.invertInnerField(&self.inner, stripped);
+                } else if (isSubcommand(arg)) {
+                    print("command changed from {s} to {s} in main loop\n", .{ self.search_scope, arg });
+                    self.search_scope = arg;
+                } else {
+                    print("add args inside while loop outside self.prev", .{});
+                    try self.addArgsToCmd(&self.inner, arg);
+                    self.prev = null;
                 }
             }
 
             if (self.prev) |prev| {
                 if (isOption(prev)) {
-                    const stripped = prev[2..];
+                    const tmp = prev;
                     self.prev = null;
-                    try invertFieldRecursive(&self.inner, curr_scope, stripped);
+                    const pair = self.handleOption(&self.inner, tmp);
+
+                    print("PAIR in prev block outside while loop: {s}->{s}\n", .{ pair.name, pair.value orelse "null" });
+
+                    const stripped = pair.name[2..];
+                    if (pair.value) |value| try self.modifyInnerField(&self.inner, stripped, value) else try self.invertInnerField(&self.inner, stripped);
+                } else if (isSubcommand(prev)) {
+                    self.search_scope = prev;
+                    self.prev = null;
+                } else {
+                    print("add args outside while loop inside self.prev", .{});
+                    try self.addArgsToCmd(&self.inner, prev);
+                    self.prev = null;
                 }
             }
+        }
+
+        fn modifyInnerField(self: *Self, s: anytype, optname: []const u8, value: []const u8) !void {
+            const anon_type_info = @typeInfo(@TypeOf(s.*));
+            const fields = anon_type_info.@"struct".fields;
+
+            inline for (fields) |field| {
+                const child_info = @typeInfo(field.type);
+                if (isSubcommand(self.search_scope) and child_info == .@"struct" and eql(u8, field.name, self.search_scope)) {
+                    try self.modifyInnerField(&@field(s, field.name), optname, value);
+                    return;
+                }
+            }
+
+            inline for (fields) |field| {
+                if (eql(u8, field.name, optname)) {
+                    @field(s, field.name) = try parseDefault(field.type, value);
+                    return;
+                }
+            }
+
+            return error.UnrecognizedFlag;
+        }
+
+        fn invertInnerField(self: *Self, s: anytype, optname: []const u8) !void {
+            const anon_type_info = @typeInfo(@TypeOf(s.*));
+            const fields = anon_type_info.@"struct".fields;
+
+            inline for (fields) |field| {
+                const child_info = @typeInfo(field.type);
+                if (isSubcommand(self.search_scope) and child_info == .@"struct" and eql(u8, field.name, self.search_scope)) {
+                    try self.invertInnerField(&@field(s, field.name), optname);
+                    return;
+                }
+            }
+
+            inline for (fields) |field| {
+                if (eql(u8, field.name, optname) and field.type == bool) {
+                    @field(s, field.name) = !@field(s, field.name);
+                    return;
+                } else if (eql(u8, field.name, optname) and field.type != bool) {
+                    return error.UnableToInvert;
+                }
+            }
+
+            return error.UnrecognizedFlag;
+        }
+
+        fn initializeCmdArgs(self: *Self, s: anytype) void {
+            const sinfo = @typeInfo(@TypeOf(s.*));
+            const fields = sinfo.@"struct".fields;
+
+            inline for (fields) |field| {
+                const child_info = @typeInfo(field.type);
+                //if (isSubcommand(self.search_scope) and child_info == .@"struct" and eql(u8, field.name, self.search_scope)) {
+                //    self.initializeCmdArgs(&@field(s, field.name));
+                //}
+                if (child_info == .@"struct" and field.type != Allocator and field.type != std.ArrayList([]const u8)) {
+                    self.initializeCmdArgs(&@field(s, field.name));
+                }
+            }
+
+            inline for (fields) |field| {
+                if (eql(u8, field.name, "args") and field.type == std.ArrayList([]const u8)) {
+                    @field(s, field.name) = std.ArrayList([]const u8).init(self.allocator);
+                }
+            }
+        }
+
+        fn addArgsToCmd(self: *Self, s: anytype, arg: []const u8) !void {
+            const sinfo = @typeInfo(@TypeOf(s.*));
+            const fields = sinfo.@"struct".fields;
+
+            inline for (fields) |field| {
+                const child_info = @typeInfo(field.type);
+                if (isSubcommand(self.search_scope) and child_info == .@"struct" and eql(u8, field.name, self.search_scope)) {
+                    try self.addArgsToCmd(&@field(s, field.name), arg);
+                    return;
+                }
+            }
+
+            inline for (fields) |field| {
+                if (eql(u8, field.name, "args") and field.type == std.ArrayList([]const u8)) {
+                    try s.args.append(arg);
+                }
+            }
+        }
+
+        fn handleOption(self: *Self, s: anytype, arg: []const u8) Pair {
+            //if (self.prev) |prev| {
+            //    print("hey found inside handleOption {s}\n", .{prev});
+            //    if (isOption(prev)) {
+            //        const tmp = prev;
+            //        self.prev = null;
+            //        return self.handleOption(tmp);
+            //    }
+            //}
+            const sinfo = @typeInfo(@TypeOf(s.*));
+            const fields = sinfo.@"struct".fields;
+
+            inline for (fields) |field| {
+                const ch_info = @typeInfo(field.type);
+                if (isSubcommand(self.search_scope) and ch_info == .@"struct" and eql(u8, field.name, self.search_scope)) {
+                    return self.handleOption(&@field(s, field.name), arg);
+                }
+            }
+
+            if (isAssignmentOption(arg)) {
+                return extractAssignmentOption(arg);
+            }
+
+            const item = self.args.next() orelse return Pair{ .name = arg, .value = null };
+            if (isAssignmentOption(item)) {
+                self.prev = item;
+                return Pair{ .name = arg, .value = null };
+            }
+
+            if (isOption(item)) {
+                self.prev = item;
+                return Pair{ .name = arg, .value = null };
+            }
+
+            if (isSubcommand(item)) {
+                // print("command changed from {s} to {s} in handleOption", .{ self.search_scope, item });
+                // self.search_scope = item;
+                self.prev = item;
+                return Pair{ .name = arg, .value = null };
+            }
+
+            //print("scope: {s}", .{self.search_scope});
+            //print("KVPAIR: {s}->{s}", .{ arg, item });
+            inline for (fields) |field| {
+                //print("field name of the current scope: {s}\n", .{field.name});
+                const stripped = arg[2..];
+                if (eql(u8, field.name, stripped) and field.type == bool) {
+                    self.prev = item;
+                    return Pair{ .name = arg, .value = null };
+                }
+            }
+
+            self.prev = null;
+            return Pair{ .name = arg, .value = item };
         }
 
         fn extractAssignmentOption(opt: []const u8) Pair {
@@ -268,7 +331,7 @@ pub fn CLIApp(comptime T: type) type {
         }
 
         fn isOption(arg: []const u8) bool {
-            return std.mem.startsWith(u8, arg, "--");
+            return std.mem.startsWith(u8, arg, "--") and !std.mem.containsAtLeast(u8, arg, 1, "args");
         }
 
         fn isSubcommand(arg: []const u8) bool {
